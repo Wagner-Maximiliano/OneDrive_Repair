@@ -25,8 +25,10 @@ PowerShell 5.1 scripts for diagnosing and remediating enterprise-wide OneDrive s
 
 [ ] 2. Create App Registration (Cloud App Admin role is sufficient)
         Entra Portal > App Registrations > New
-        Permission: Microsoft Graph > Application > Reports.Read.All
-        Grant admin consent, create a client secret
+        Platform:    Authentication > Mobile and desktop applications
+                     Redirect URI: https://login.microsoftonline.com/common/oauth2/nativeclient
+        Permission:  Microsoft Graph > Delegated > Reports.Read.All
+        Grant admin consent — no client secret needed or used
 
 [ ] 3. Run Export-OneDriveUsageReport.ps1 (Period D90) — save as BASELINE
 
@@ -59,11 +61,18 @@ PowerShell 5.1 scripts for diagnosing and remediating enterprise-wide OneDrive s
 ## Script 1 — Export-OneDriveUsageReport.ps1
 
 ```powershell
+# A browser window will open for authentication — no secret required
 .\Export-OneDriveUsageReport.ps1 `
-    -TenantId     "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
-    -ClientId     "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
-    -ClientSecret "your-secret-value" `
-    -Period       D90
+    -TenantId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
+    -ClientId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
+    -Period   D90
+```
+
+**Required module (install once):**
+```powershell
+Install-Module Microsoft.Graph.Authentication -Scope CurrentUser
+# Optional — enables cleaner download path:
+Install-Module Microsoft.Graph.Reports -Scope CurrentUser
 ```
 
 **Output columns include:**
@@ -159,7 +168,8 @@ PowerShell 5.1 scripts for diagnosing and remediating enterprise-wide OneDrive s
 - [ ] Devices are Azure AD / Hybrid joined with valid PRT (`dsregcmd /status`)
 - [ ] No CA policy requiring MFA for OneDrive on compliant/hybrid-joined devices
 - [ ] Graph report obfuscation disabled in M365 Admin Centre
-- [ ] App Registration created with `Reports.Read.All` application permission
+- [ ] App Registration configured with delegated `Reports.Read.All` permission and Mobile/desktop platform (no secret needed)
+- [ ] `Microsoft.Graph.Authentication` module installed on the admin workstation running the export script
 
 ---
 

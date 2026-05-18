@@ -1,27 +1,36 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Exports OneDrive for Business usage report via Microsoft Graph API.
+    Exports OneDrive for Business usage report via Microsoft Graph.
+    Uses interactive web authentication — no client secret required.
 
 .DESCRIPTION
-    Uses app-only (client credentials) authentication to pull the
-    getOneDriveUsageAccountDetail report. Adds computed columns for
-    easy identification of users affected by the March 2026 sync outage.
+    Authenticates via Connect-MgGraph using delegated permissions.
+    A browser window will open for you to sign in before the report downloads.
 
-    PREREQUISITES:
-    - App Registration in Entra ID with Reports.Read.All application permission
-    - Admin consent granted on that permission
-    - Report obfuscation disabled: M365 Admin Centre > Settings > Services > Reports
-      "Hide user details in all reports" must be OFF, otherwise UPNs will be hashed.
+    REQUIRED MODULE (install once):
+        Install-Module Microsoft.Graph.Authentication -Scope CurrentUser
+
+    OPTIONAL — enables a cleaner report download method:
+        Install-Module Microsoft.Graph.Reports -Scope CurrentUser
+
+    APP REGISTRATION REQUIREMENTS:
+        - Platform:    Mobile and desktop applications (enables public client flow)
+        - Permission:  Microsoft Graph > Delegated > Reports.Read.All
+        - Admin consent granted on that delegated permission
+        No client secret is needed or used.
+
+    REPORT OBFUSCATION:
+        Ensure "Hide user details in all reports" is OFF in
+        M365 Admin Centre > Settings > Services > Reports.
+        If it is ON, UPNs will appear as hashed strings and the comparison
+        script will not be able to match users across exports.
 
 .PARAMETER TenantId
     Azure AD Tenant ID (GUID).
 
 .PARAMETER ClientId
-    App Registration Client ID (GUID).
-
-.PARAMETER ClientSecret
-    App Registration Client Secret value.
+    App Registration Client ID / App ID (GUID).
 
 .PARAMETER Period
     Report period. Use D90 for the initial baseline (covers March 21).
@@ -35,9 +44,8 @@
 
 .EXAMPLE
     .\Export-OneDriveUsageReport.ps1 `
-        -TenantId    "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
-        -ClientId    "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
-        -ClientSecret "your-secret-value" `
+        -TenantId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
+        -ClientId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
         -Period D90
 
 .NOTES
@@ -49,7 +57,6 @@
 param(
     [Parameter(Mandatory)][string]$TenantId,
     [Parameter(Mandatory)][string]$ClientId,
-    [Parameter(Mandatory)][string]$ClientSecret,
     [ValidateSet('D7', 'D30', 'D90', 'D180')]
     [string]$Period     = 'D90',
     [string]$OutputPath = ".\OneDriveUsage_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv",
@@ -60,45 +67,79 @@ $ErrorActionPreference = 'Stop'
 $cutoff = [datetime]$CutoffDate
 
 # ---------------------------------------------------------------------------
-# Authenticate
+# Module check
 # ---------------------------------------------------------------------------
-Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Authenticating to Microsoft Graph..." -ForegroundColor Cyan
+if (-not (Get-Module -Name Microsoft.Graph.Authentication -ListAvailable)) {
+    Write-Error @"
+The Microsoft.Graph.Authentication module is not installed.
+Run this once in an elevated PowerShell session, then re-run this script:
 
-$tokenResponse = Invoke-RestMethod -Method Post `
-    -Uri         "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token" `
-    -ContentType 'application/x-www-form-urlencoded' `
-    -Body @{
-        grant_type    = 'client_credentials'
-        client_id     = $ClientId
-        client_secret = $ClientSecret
-        scope         = 'https://graph.microsoft.com/.default'
-    }
+    Install-Module Microsoft.Graph.Authentication -Scope CurrentUser
+"@
+    exit 1
+}
 
-$headers   = @{ Authorization = "Bearer $($tokenResponse.access_token)" }
-$reportUri = "https://graph.microsoft.com/v1.0/reports/getOneDriveUsageAccountDetail(period='$Period')"
+Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
+
+# Reports module is optional — provides a cleaner download path
+$useReportsCmdlet = [bool](Get-Module -Name Microsoft.Graph.Reports -ListAvailable)
+if ($useReportsCmdlet) {
+    Import-Module Microsoft.Graph.Reports -ErrorAction SilentlyContinue
+    Write-Host "Microsoft.Graph.Reports module detected — using Get-MgReportOneDriveUsageAccountDetail." -ForegroundColor Gray
+} else {
+    Write-Host "Microsoft.Graph.Reports not found — using Invoke-MgGraphRequest fallback." -ForegroundColor Gray
+    Write-Host "To install the Reports module: Install-Module Microsoft.Graph.Reports -Scope CurrentUser" -ForegroundColor Gray
+}
+
+# ---------------------------------------------------------------------------
+# Interactive authentication
+# A browser window will open. Sign in with your admin account.
+# ---------------------------------------------------------------------------
+Write-Host ""
+Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Connecting to Microsoft Graph..." -ForegroundColor Cyan
+Write-Host "Your browser will open for authentication. Sign in and return here." -ForegroundColor DarkYellow
+Write-Host ""
+
+try {
+    Connect-MgGraph -ClientId $ClientId -TenantId $TenantId -Scopes "Reports.Read.All" -NoWelcome
+} catch {
+    # -NoWelcome was added in SDK v2 — fall back silently for older installs
+    Connect-MgGraph -ClientId $ClientId -TenantId $TenantId -Scopes "Reports.Read.All"
+}
+
+$context = Get-MgContext
+Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Connected as: $($context.Account)" -ForegroundColor Green
 
 # ---------------------------------------------------------------------------
 # Fetch report
-# The endpoint issues a 302 redirect to a temporary Azure blob CSV URL.
-# We try MaximumRedirection first; if PS 5.1 throws on the redirect we
-# extract the Location header and fetch the blob directly.
 # ---------------------------------------------------------------------------
-Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Fetching report (period: $Period)..." -ForegroundColor Cyan
+Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Fetching OneDrive usage report (period: $Period)..." -ForegroundColor Cyan
 
-$rawCsv = $null
-try {
-    $response = Invoke-WebRequest -Uri $reportUri -Headers $headers `
-                    -MaximumRedirection 10 -UseBasicParsing
-    $rawCsv   = $response.Content
-} catch {
-    if ($_.Exception.Response) {
-        $blobUri = $_.Exception.Response.Headers['Location']
-        if (-not $blobUri) { throw "Could not retrieve report redirect URL: $_" }
-        $rawCsv = (Invoke-WebRequest -Uri $blobUri -UseBasicParsing).Content
-    } else {
-        throw "Failed to retrieve report: $_"
+$rawCsv  = $null
+$tempFile = $null
+
+if ($useReportsCmdlet) {
+    # Reports module cmdlet handles the redirect and encoding natively
+    $tempFile = [System.IO.Path]::GetTempFileName()
+    try {
+        Get-MgReportOneDriveUsageAccountDetail -Period $Period -OutFile $tempFile
+        $rawCsv = Get-Content -Path $tempFile -Raw -Encoding UTF8
+    } finally {
+        if ($tempFile -and (Test-Path $tempFile)) {
+            Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
+        }
     }
+} else {
+    # Invoke-MgGraphRequest follows the blob storage redirect automatically.
+    # -OutputType String returns the raw CSV body.
+    $rawCsv = Invoke-MgGraphRequest `
+        -Uri    "https://graph.microsoft.com/v1.0/reports/getOneDriveUsageAccountDetail(period='$Period')" `
+        -Method GET `
+        -OutputType String
 }
+
+Disconnect-MgGraph | Out-Null
+Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Disconnected from Graph." -ForegroundColor Gray
 
 # ---------------------------------------------------------------------------
 # Parse CSV (strip UTF-8 BOM that Graph sometimes prepends)
@@ -138,10 +179,10 @@ $affectedUsers = ($enriched | Where-Object { $_.AffectedByOutage -eq $true  }).C
 
 Write-Host ""
 Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Export complete." -ForegroundColor Green
-Write-Host "  Output file           : $OutputPath"          -ForegroundColor White
-Write-Host "  Total records         : $totalUsers"          -ForegroundColor White
-Write-Host "  Active / healthy      : $activeUsers"         -ForegroundColor Green
-Write-Host "  Affected by outage    : $affectedUsers"       -ForegroundColor Yellow
+Write-Host "  Output file        : $OutputPath"    -ForegroundColor White
+Write-Host "  Total records      : $totalUsers"    -ForegroundColor White
+Write-Host "  Active / healthy   : $activeUsers"   -ForegroundColor Green
+Write-Host "  Affected by outage : $affectedUsers" -ForegroundColor Yellow
 Write-Host ""
 Write-Host "REMINDER: Graph reports have a 24-48 hour refresh delay." -ForegroundColor DarkYellow
 Write-Host "REMINDER: If UPNs appear as hashed strings, disable 'Hide user details'" -ForegroundColor DarkYellow
