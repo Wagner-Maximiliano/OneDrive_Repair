@@ -2,7 +2,6 @@
 
 PowerShell 5.1 scripts for diagnosing and remediating enterprise-wide OneDrive sync failures.
 
-> **Context:** ~300 of 1,600 users stopped syncing around 2026-03-21. Devices are Hybrid AD Joined, co-managed with Intune and SCCM.
 
 ---
 
