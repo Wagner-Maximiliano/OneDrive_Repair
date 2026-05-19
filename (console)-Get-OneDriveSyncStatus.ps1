@@ -9,8 +9,6 @@
 & {
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-$TargetUser              = ''   # Leave blank to auto-detect the logged-in user
-                                # Or set to 'DOMAIN\username' for a specific user
 $InactivityThresholdDays = 14   # Days of no sync activity before flagging NOT_SYNCING
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -46,17 +44,6 @@ $resolvedDomain   = ''
 $resolvedUsername = ''
 $detectionMethod  = ''
 
-if ($TargetUser -ne '') {
-    if ($TargetUser -match '\\') {
-        $resolvedDomain   = $TargetUser.Split('\')[0]
-        $resolvedUsername = $TargetUser.Split('\')[1]
-    } else {
-        $resolvedDomain   = $env:USERDOMAIN
-        $resolvedUsername = $TargetUser
-    }
-    $detectionMethod = 'Manual (variable)'
-}
-
 if (-not $resolvedUsername) {
     $explorerProcs = Get-WmiObject -Class Win32_Process -Filter "Name='explorer.exe'" -ErrorAction SilentlyContinue
     foreach ($proc in $explorerProcs) {
@@ -83,7 +70,7 @@ if (-not $resolvedUsername) {
     Write-Output "===== OneDrive Sync Status ====="
     Write-Output "Computer      : $env:COMPUTERNAME"
     Write-Output "Overall Health: NO_USER"
-    Write-Output "Recommendation: No interactive user detected. Set TargetUser at the top and re-paste."
+    Write-Output "Recommendation: No interactive user detected. Ensure a user is logged into the desktop on this machine."
     Write-Output "================================"
     return
 }
