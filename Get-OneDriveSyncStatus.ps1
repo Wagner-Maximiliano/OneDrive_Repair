@@ -16,16 +16,36 @@
         Reads the target user's registry via HKU\<SID> and their profile path.
         Requires local admin rights on the target machine.
         PRT status cannot be verified from a different user context — reported
-        as UNKNOWN. All other checks (registry, logs, process, device join) work fully.
+        as UNKNOWN. All other checks work fully.
+
+    WHAT IS CHECKED:
+        The script uses multiple signals to determine real sync activity,
+        not just what the SyncDiagnostics.log status line says.
+
+        SyncDiagnostics.log can show "Synced" even when OneDrive has been
+        disconnected for months — it only means "no local pending changes",
+        not "successfully connected to the cloud recently."
+
+        More reliable signals used by this script:
+          - SyncEngine log last write time  (most reliable activity indicator)
+          - ODL log file last write time    (secondary activity indicator)
+          - LastSyncAttempt / LastSuccessfulSync timestamps parsed from logs
+          - DaysSinceActivity computed from the above
+
+        If DaysSinceActivity exceeds -InactivityThresholdDays (default: 14),
+        the device is flagged as STALE regardless of the SyncDiagnostics status.
 
 .PARAMETER TargetUser
-    Optional. The user to inspect when running from a management account.
+    Optional. User to inspect when running from a management account.
     Accepts DOMAIN\username or just username.
-    If omitted and the script is running as a different user than the console
-    session, it auto-detects the interactively logged-in user.
+    Use 'auto' to auto-detect the interactively logged-in console user.
+
+.PARAMETER InactivityThresholdDays
+    Days of no sync engine activity before the device is flagged as STALE.
+    Default: 14. Lower this if you want to catch shorter gaps.
 
 .EXAMPLE
-    # User mode — run as the affected user (Intune/SCCM):
+    # User mode (Intune / SCCM):
     .\Get-OneDriveSyncStatus.ps1
 
 .EXAMPLE
@@ -33,21 +53,27 @@
     .\Get-OneDriveSyncStatus.ps1 -TargetUser "CONTOSO\jsmith"
 
 .EXAMPLE
-    # Management mode — auto-detect the logged-in user:
+    # Management mode — auto-detect console user:
     .\Get-OneDriveSyncStatus.ps1 -TargetUser auto
+
+.EXAMPLE
+    # Tighter threshold — flag anything inactive for more than 3 days:
+    .\Get-OneDriveSyncStatus.ps1 -TargetUser "CONTOSO\jsmith" -InactivityThresholdDays 3
 
 .NOTES
     OverallHealth values:
-        OK             - OneDrive running and account configured
-        NOT_SYNCING    - Not running or not signed in; safe to remediate
-        POLICY_MISSING - SilentAccountConfig not deployed; deploy before resetting
-        PRT_UNKNOWN    - Running as management account; PRT must be verified separately
+        OK             - OneDrive running, signed in, and recently active
+        STALE          - Logs show "Synced" but no real activity for X days
+        NOT_SYNCING    - Not running or account not configured
+        POLICY_MISSING - SilentAccountConfig not deployed
+        PRT_UNKNOWN    - Management mode; PRT must be verified manually
         PRT_INVALID    - PRT expired/missing (user mode only)
-        DEVICE_ERROR   - Not Azure AD joined; cannot use silent sign-in
-        BLOCKED        - CA or MFA policy blocking; fix policy before resetting
+        DEVICE_ERROR   - Not Azure AD joined
+        BLOCKED        - CA or MFA policy blocking sign-in
 #>
 param(
-    [string]$TargetUser = ''
+    [string]$TargetUser              = '',
+    [int]   $InactivityThresholdDays = 14
 )
 
 $ErrorActionPreference = 'SilentlyContinue'
@@ -78,12 +104,8 @@ $ErrorDescriptions = @{
 # ---------------------------------------------------------------------------
 # Determine run mode and resolve target user context
 # ---------------------------------------------------------------------------
-
-# Get the interactively logged-in console user (works from any account)
 $consoleUserRaw = (Get-WmiObject -Class Win32_ComputerSystem).UserName
-# Returns DOMAIN\username or empty if no interactive session
-
-$currentUser = $env:USERNAME
+$currentUser    = $env:USERNAME
 $managementMode = $false
 $targetUsername = ''
 $targetDomain   = ''
@@ -93,11 +115,9 @@ $regBase        = 'HKCU:'
 $localAppData   = $env:LOCALAPPDATA
 
 if ($TargetUser -eq 'auto' -or ($TargetUser -eq '' -and $consoleUserRaw -and $consoleUserRaw -notmatch [regex]::Escape($currentUser))) {
-    # Auto-detect: we are not the console user, switch to management mode
     $managementMode = $true
     $resolveFrom    = if ($TargetUser -eq 'auto' -or $TargetUser -eq '') { $consoleUserRaw } else { $TargetUser }
 } elseif ($TargetUser -ne '' -and $TargetUser -ne 'auto') {
-    # Explicit target specified
     $managementMode = $true
     $resolveFrom    = $TargetUser
 }
@@ -108,7 +128,6 @@ if ($managementMode) {
         exit 1
     }
 
-    # Parse DOMAIN\username
     if ($resolveFrom -match '\\') {
         $targetDomain   = $resolveFrom.Split('\')[0]
         $targetUsername = $resolveFrom.Split('\')[1]
@@ -117,36 +136,29 @@ if ($managementMode) {
         $targetUsername = $resolveFrom
     }
 
-    # Resolve SID
     try {
-        $ntAccount  = New-Object System.Security.Principal.NTAccount($targetDomain, $targetUsername)
-        $targetSid  = $ntAccount.Translate([System.Security.Principal.SecurityIdentifier]).Value
+        $ntAccount = New-Object System.Security.Principal.NTAccount($targetDomain, $targetUsername)
+        $targetSid = $ntAccount.Translate([System.Security.Principal.SecurityIdentifier]).Value
     } catch {
-        # Try without domain prefix (local account or UPN format)
         try {
-            $ntAccount  = New-Object System.Security.Principal.NTAccount($targetUsername)
-            $targetSid  = $ntAccount.Translate([System.Security.Principal.SecurityIdentifier]).Value
+            $ntAccount = New-Object System.Security.Principal.NTAccount($targetUsername)
+            $targetSid = $ntAccount.Translate([System.Security.Principal.SecurityIdentifier]).Value
         } catch {
             Write-Output "ERROR: Cannot resolve SID for user '$resolveFrom'. Check the username and try again."
             exit 1
         }
     }
 
-    # Resolve profile path from HKLM profile list
     $profileKey    = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$targetSid"
     $targetProfile = (Get-ItemProperty -Path $profileKey -ErrorAction SilentlyContinue).ProfileImagePath
-
     if (-not $targetProfile) {
         Write-Output "ERROR: Cannot find profile path for '$targetUsername' (SID: $targetSid)."
-        Write-Output "       The user may not have a local profile on this machine."
         exit 1
     }
 
-    # Verify the user's registry hive is loaded (requires them to be logged in)
     $hkuPath = "Registry::HKU\$targetSid"
     if (-not (Test-Path $hkuPath)) {
-        Write-Output "ERROR: Registry hive for '$targetUsername' is not loaded."
-        Write-Output "       The user must be actively logged in for management mode to read their registry."
+        Write-Output "ERROR: Registry hive for '$targetUsername' is not loaded. User must be logged in."
         exit 1
     }
 
@@ -166,31 +178,41 @@ if ($managementMode) {
 # Build status object
 # ---------------------------------------------------------------------------
 $s = [PSCustomObject]@{
-    Timestamp          = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    ComputerName       = $env:COMPUTERNAME
-    UserName           = $targetUsername
-    ManagementMode     = $managementMode
-    OneDriveRunning    = $false
-    AccountConfigured  = $false
-    UserEmail          = ''
-    SyncFolder         = ''
-    OneDriveVersion    = ''
-    LogLastWritten     = ''
-    SyncStatus         = 'Unknown'
-    ErrorCode          = ''
-    ErrorDescription   = ''
-    PrtValid           = $false
-    PrtVerified        = $true    # False when running in management mode
-    AzureAdJoined      = $false
-    HybridJoined       = $false
-    SilentConfigPolicy = $false
-    OverallHealth      = 'UNKNOWN'
-    Recommendation     = ''
+    Timestamp                = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    ComputerName             = $env:COMPUTERNAME
+    UserName                 = $targetUsername
+    ManagementMode           = $managementMode
+    OneDriveRunning          = $false
+    AccountConfigured        = $false
+    UserEmail                = ''
+    SyncFolder               = ''
+    OneDriveVersion          = ''
+    # --- Activity signals ---
+    SyncEngineLastActivity   = ''   # Last write of SyncEngine*.log files
+    ODLLastActivity          = ''   # Last write of *.odl files
+    LastKnownActivity        = ''   # Most recent of the above two
+    DaysSinceActivity        = -1   # Integer days since LastKnownActivity
+    LastSyncAttemptInLog     = ''   # Parsed from SyncDiagnostics.log if present
+    # --- Status from logs ---
+    SyncStatusFromLog        = ''   # Raw status string from SyncDiagnostics.log
+    SyncStatus               = ''   # Final resolved status (may override log value)
+    ErrorCode                = ''
+    ErrorDescription         = ''
+    # --- Device / policy ---
+    PrtValid                 = $false
+    PrtVerified              = $true
+    AzureAdJoined            = $false
+    HybridJoined             = $false
+    SilentConfigPolicy       = $false
+    # --- Conclusion ---
+    OverallHealth            = 'UNKNOWN'
+    Recommendation           = ''
 }
 
+$logsBase = "$localAppData\Microsoft\OneDrive\logs\Business1"
+
 # ---------------------------------------------------------------------------
-# 1. Process check
-# WMI allows querying process owner from any account — works in both modes
+# 1. Process check (WMI — works from any account)
 # ---------------------------------------------------------------------------
 $odProcs = Get-WmiObject -Class Win32_Process -Filter "Name='OneDrive.exe'" -ErrorAction SilentlyContinue
 if ($odProcs) {
@@ -198,12 +220,10 @@ if ($odProcs) {
         $owner = $_.GetOwner()
         $owner.User -eq $targetUsername
     })
-} else {
-    $s.OneDriveRunning = $false
 }
 
 # ---------------------------------------------------------------------------
-# 2. Registry — account configuration (via HKU\SID in management mode)
+# 2. Registry — account configuration
 # ---------------------------------------------------------------------------
 $acctRegPath = "$regBase\SOFTWARE\Microsoft\OneDrive\Accounts\Business1"
 $acctReg     = Get-ItemProperty -Path $acctRegPath -ErrorAction SilentlyContinue
@@ -215,7 +235,6 @@ if ($acctReg) {
 
 # ---------------------------------------------------------------------------
 # 3. OneDrive version
-# Per-user install lives in the user's LOCALAPPDATA; machine install in Program Files
 # ---------------------------------------------------------------------------
 foreach ($candidate in @(
     "$localAppData\Microsoft\OneDrive\OneDrive.exe",
@@ -229,31 +248,85 @@ foreach ($candidate in @(
 }
 
 # ---------------------------------------------------------------------------
-# 4. SyncDiagnostics.log — sync status and error codes
+# 4. Activity signals — the reliable indicators of real sync activity
+#
+# SyncDiagnostics.log "Status: Synced" only means no local pending changes.
+# It does NOT mean OneDrive successfully connected to the cloud recently.
+# A disconnected OneDrive can show Synced indefinitely if the user has no
+# local file changes.
+#
+# The signals below cannot be faked by cached state:
+#   - SyncEngine*.log files are written only when the sync engine is active
+#   - *.odl files are updated by any cloud communication from the client
+#   - Parsed LastSyncAttempt timestamp from SyncDiagnostics content
 # ---------------------------------------------------------------------------
-$logFile = "$localAppData\Microsoft\OneDrive\logs\Business1\SyncDiagnostics.log"
-if (Test-Path $logFile) {
-    $logItem          = Get-Item $logFile
-    $s.LogLastWritten = $logItem.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss')
 
-    $logContent = Get-Content -Path $logFile -ErrorAction SilentlyContinue
-    if ($logContent) {
-        $tail = if ($logContent.Count -gt 300) { $logContent[-300..-1] } else { $logContent }
+# -- 4a. SyncEngine log recency --
+$syncEngineLogs = Get-ChildItem -Path $logsBase -Filter 'SyncEngine*.log' -ErrorAction SilentlyContinue |
+    Sort-Object LastWriteTime -Descending
+
+if ($syncEngineLogs) {
+    $s.SyncEngineLastActivity = $syncEngineLogs[0].LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss')
+}
+
+# -- 4b. ODL file recency (OneDrive binary activity logs) --
+$odlFiles = Get-ChildItem -Path "$localAppData\Microsoft\OneDrive\logs" -Filter '*.odl' -Recurse -ErrorAction SilentlyContinue |
+    Sort-Object LastWriteTime -Descending
+
+if ($odlFiles) {
+    $s.ODLLastActivity = $odlFiles[0].LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss')
+}
+
+# -- 4c. Derive LastKnownActivity and DaysSinceActivity --
+$activityCandidates = @()
+if ($s.SyncEngineLastActivity) { $activityCandidates += [datetime]::Parse($s.SyncEngineLastActivity) }
+if ($s.ODLLastActivity)        { $activityCandidates += [datetime]::Parse($s.ODLLastActivity) }
+
+if ($activityCandidates) {
+    $mostRecent              = ($activityCandidates | Sort-Object -Descending)[0]
+    $s.LastKnownActivity     = $mostRecent.ToString('yyyy-MM-dd HH:mm:ss')
+    $s.DaysSinceActivity     = [int]([datetime]::Now - $mostRecent).TotalDays
+}
+
+# -- 4d. Parse SyncDiagnostics.log for status string and last-sync timestamp --
+$diagLog = "$logsBase\SyncDiagnostics.log"
+if (Test-Path $diagLog) {
+    $diagContent = Get-Content -Path $diagLog -ErrorAction SilentlyContinue
+    if ($diagContent) {
+        $tail = if ($diagContent.Count -gt 400) { $diagContent[-400..-1] } else { $diagContent }
+
         foreach ($line in $tail) {
+            # Sync status string
             if ($line -match 'Sync\s*Status\s*[:\|]\s*(.+)') {
-                $s.SyncStatus = $matches[1].Trim()
+                $s.SyncStatusFromLog = $matches[1].Trim()
             }
+
+            # Last sync / last attempt timestamps (various formats across OD versions)
+            if ($line -match '(?:LastSyncAttempt|LastSuccessfulSync|Last Sync Time|LastSyncTime)\s*[:\|=]\s*(.+)') {
+                $s.LastSyncAttemptInLog = $matches[1].Trim()
+            }
+
+            # Hex error codes
             if ($line -match '(0x[0-9A-Fa-f]{8})') { $s.ErrorCode = $matches[1] }
-            if ($line -match '(AADSTS\d{5,6})')     { $s.ErrorCode = $matches[1] }
+
+            # AADSTS error codes
+            if ($line -match '(AADSTS\d{5,6})') { $s.ErrorCode = $matches[1] }
         }
     }
 }
 
-# Infer status if log did not provide one
-if ($s.SyncStatus -eq 'Unknown') {
-    if (-not $s.OneDriveRunning)       { $s.SyncStatus = 'Not Running' }
-    elseif (-not $s.AccountConfigured) { $s.SyncStatus = 'Not Signed In' }
-    else                               { $s.SyncStatus = 'Running — status undetermined from logs' }
+# -- 4e. Resolve final SyncStatus --
+# Override the log's "Synced" claim if activity signals say otherwise
+if ($s.DaysSinceActivity -ge 0 -and $s.DaysSinceActivity -gt $InactivityThresholdDays) {
+    $s.SyncStatus = "STALE — No sync engine activity for $($s.DaysSinceActivity) days (log reports: '$($s.SyncStatusFromLog)')"
+} elseif ($s.SyncStatusFromLog) {
+    $s.SyncStatus = $s.SyncStatusFromLog
+} elseif (-not $s.OneDriveRunning) {
+    $s.SyncStatus = 'Not Running'
+} elseif (-not $s.AccountConfigured) {
+    $s.SyncStatus = 'Not Signed In'
+} else {
+    $s.SyncStatus = 'Unknown — no log data found'
 }
 
 # Resolve error description
@@ -267,14 +340,8 @@ if ($s.ErrorCode) {
 
 # ---------------------------------------------------------------------------
 # 5. Azure AD / PRT status via dsregcmd
-#
-# Device join info (AzureAdJoined, DomainJoined) is machine-wide — accurate
-# from any account context.
-#
-# PRT (AzureAdPrt) is per-user. dsregcmd run from a management account shows
-# the management account's PRT, not the target user's. In management mode we
-# mark PrtVerified = false and skip the PRT health check.
-# To verify PRT manually: log on as the user and run: dsregcmd /status
+# Device join info is machine-wide (accurate from any account).
+# PRT is per-user — cannot be read from a management account.
 # ---------------------------------------------------------------------------
 $dsreg = & dsregcmd.exe /status 2>&1
 if ($dsreg) {
@@ -286,7 +353,7 @@ if ($dsreg) {
         $s.PrtVerified = $true
     } else {
         $s.PrtValid    = $false
-        $s.PrtVerified = $false   # Cannot verify from management account
+        $s.PrtVerified = $false
     }
 }
 
@@ -298,72 +365,86 @@ $silentPol = Get-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\OneDrive'
 $s.SilentConfigPolicy = ($silentPol -ne $null -and $silentPol.SilentAccountConfig -eq 1)
 
 # ---------------------------------------------------------------------------
-# Determine overall health and recommendation
+# Determine overall health
 # ---------------------------------------------------------------------------
-$caBlocked = $s.ErrorCode -match '0x8004de86|AADSTS53003|AADSTS50072|AADSTS50076'
+$caBlocked  = $s.ErrorCode -match '0x8004de86|AADSTS53003|AADSTS50072|AADSTS50076'
+$isStale    = $s.DaysSinceActivity -ge 0 -and $s.DaysSinceActivity -gt $InactivityThresholdDays
 
 if ($caBlocked) {
     $s.OverallHealth  = 'BLOCKED'
     $s.Recommendation = "CA or MFA policy is blocking sign-in ($($s.ErrorCode): $($s.ErrorDescription)). Fix the policy before running reset — reset will not help."
+
 } elseif (-not $s.AzureAdJoined) {
     $s.OverallHealth  = 'DEVICE_ERROR'
     $s.Recommendation = 'Device is not Azure AD joined. Re-register in Entra ID (dsregcmd /join). Silent sign-in cannot work until resolved.'
+
 } elseif (-not $s.PrtVerified) {
-    # Management mode — PRT cannot be checked; report everything else and flag for manual PRT check
+    # Management mode — cannot check PRT
     if (-not $s.SilentConfigPolicy) {
         $s.OverallHealth  = 'POLICY_MISSING'
-        $s.Recommendation = 'SilentAccountConfig policy not deployed. Deploy via Intune before running Reset-OneDriveSync.ps1. Also verify PRT manually: run dsregcmd /status as the user.'
-    } elseif (-not $s.OneDriveRunning -or -not $s.AccountConfigured) {
+        $s.Recommendation = 'SilentAccountConfig policy not deployed. Deploy via Intune before resetting. Also verify PRT manually: run dsregcmd /status as the user.'
+    } elseif (-not $s.OneDriveRunning -or -not $s.AccountConfigured -or $isStale) {
         $s.OverallHealth  = 'NOT_SYNCING'
-        $s.Recommendation = 'OneDrive not running or not signed in. Safe to remediate. NOTE: PRT not verified from management account — confirm with dsregcmd /status as the user before deploying at scale.'
+        $s.Recommendation = "OneDrive not active ($($s.DaysSinceActivity) days since last activity). Safe to remediate. NOTE: PRT not verified — confirm with dsregcmd /status as the user before deploying at scale."
     } else {
         $s.OverallHealth  = 'PRT_UNKNOWN'
-        $s.Recommendation = 'OneDrive appears running. PRT cannot be verified from a management account. Run dsregcmd /status as the target user to confirm (AzureAdPrt : YES).'
+        $s.Recommendation = 'OneDrive appears recently active. PRT cannot be verified from a management account. Run dsregcmd /status as the target user to confirm (AzureAdPrt : YES).'
     }
+
 } elseif (-not $s.PrtValid) {
     $s.OverallHealth  = 'PRT_INVALID'
     $s.Recommendation = 'PRT is invalid. Have user sign out and back into Windows, or run: dsregcmd /refreshprt. Reset will likely fail silently without a valid PRT.'
+
 } elseif (-not $s.SilentConfigPolicy) {
     $s.OverallHealth  = 'POLICY_MISSING'
     $s.Recommendation = 'SilentAccountConfig policy not deployed (HKLM:\SOFTWARE\Policies\Microsoft\OneDrive\SilentAccountConfig = 1). Deploy via Intune before running Reset-OneDriveSync.ps1.'
-} elseif (-not $s.OneDriveRunning -or -not $s.AccountConfigured) {
+
+} elseif (-not $s.OneDriveRunning -or -not $s.AccountConfigured -or $isStale) {
     $s.OverallHealth  = 'NOT_SYNCING'
-    $s.Recommendation = 'Prerequisites look good. Run Reset-OneDriveSync.ps1 to restore sync silently.'
+    $s.Recommendation = "OneDrive not active ($($s.DaysSinceActivity) days since last sync engine activity). Run Reset-OneDriveSync.ps1 to restore sync."
+
 } else {
     $s.OverallHealth  = 'OK'
-    $s.Recommendation = 'OneDrive appears configured and running. No remediation needed.'
+    $s.Recommendation = "OneDrive active $($s.DaysSinceActivity) day(s) ago. No remediation needed."
 }
 
 # ---------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------
 Write-Output "===== OneDrive Sync Status ====="
-Write-Output "Timestamp          : $($s.Timestamp)"
-Write-Output "Computer           : $($s.ComputerName)"
-Write-Output "User               : $($s.UserName)"
-Write-Output "Management Mode    : $($s.ManagementMode)"
-Write-Output "OD Running         : $($s.OneDriveRunning)"
-Write-Output "Account Configured : $($s.AccountConfigured)"
-Write-Output "User Email         : $($s.UserEmail)"
-Write-Output "Sync Folder        : $($s.SyncFolder)"
-Write-Output "OD Version         : $($s.OneDriveVersion)"
-Write-Output "Log Last Written   : $($s.LogLastWritten)"
-Write-Output "Sync Status        : $($s.SyncStatus)"
-Write-Output "Error Code         : $($s.ErrorCode)"
-Write-Output "Error Detail       : $($s.ErrorDescription)"
-Write-Output "Azure AD Joined    : $($s.AzureAdJoined)"
-Write-Output "Hybrid Joined      : $($s.HybridJoined)"
-Write-Output "PRT Valid          : $(if ($s.PrtVerified) { $s.PrtValid } else { 'UNKNOWN (management mode — verify manually)' })"
-Write-Output "SilentAcctCfg Pol  : $($s.SilentConfigPolicy)"
-Write-Output "Overall Health     : $($s.OverallHealth)"
-Write-Output "Recommendation     : $($s.Recommendation)"
+Write-Output "Timestamp                : $($s.Timestamp)"
+Write-Output "Computer                 : $($s.ComputerName)"
+Write-Output "User                     : $($s.UserName)"
+Write-Output "Management Mode          : $($s.ManagementMode)"
+Write-Output "--- Account ---"
+Write-Output "OD Running               : $($s.OneDriveRunning)"
+Write-Output "Account Configured       : $($s.AccountConfigured)"
+Write-Output "User Email               : $($s.UserEmail)"
+Write-Output "Sync Folder              : $($s.SyncFolder)"
+Write-Output "OD Version               : $($s.OneDriveVersion)"
+Write-Output "--- Activity (reliable signals) ---"
+Write-Output "SyncEngine Last Activity : $($s.SyncEngineLastActivity)"
+Write-Output "ODL Last Activity        : $($s.ODLLastActivity)"
+Write-Output "Last Known Activity      : $($s.LastKnownActivity)"
+Write-Output "Days Since Activity      : $(if ($s.DaysSinceActivity -ge 0) { $s.DaysSinceActivity } else { 'No log files found' })"
+Write-Output "Last Sync Attempt (log)  : $($s.LastSyncAttemptInLog)"
+Write-Output "Inactivity Threshold     : $InactivityThresholdDays days"
+Write-Output "--- Status ---"
+Write-Output "Sync Status (log)        : $($s.SyncStatusFromLog)"
+Write-Output "Sync Status (resolved)   : $($s.SyncStatus)"
+Write-Output "Error Code               : $($s.ErrorCode)"
+Write-Output "Error Detail             : $($s.ErrorDescription)"
+Write-Output "--- Device ---"
+Write-Output "Azure AD Joined          : $($s.AzureAdJoined)"
+Write-Output "Hybrid Joined            : $($s.HybridJoined)"
+Write-Output "PRT Valid                : $(if ($s.PrtVerified) { $s.PrtValid } else { 'UNKNOWN (management mode — run dsregcmd /status as the user)' })"
+Write-Output "SilentAcctCfg Policy     : $($s.SilentConfigPolicy)"
+Write-Output "--- Conclusion ---"
+Write-Output "Overall Health           : $($s.OverallHealth)"
+Write-Output "Recommendation           : $($s.Recommendation)"
 Write-Output "================================"
 
-# ---------------------------------------------------------------------------
-# Exit codes (Intune Detection Script / standalone)
-# Exit 0 = Compliant / healthy
-# Exit 1 = Non-compliant / needs attention
-# ---------------------------------------------------------------------------
+# Exit codes for Intune Detection Script
 if ($s.OverallHealth -eq 'OK') {
     Write-Output "RESULT: Compliant"
     exit 0
